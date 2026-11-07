@@ -1,0 +1,28 @@
+name: Harvest cen
+
+on:
+  schedule:
+    - cron: "7 */3 * * *"        # było co 6 godzin; częściej = szybciej kończy się pełny cykl lotnisk
+  workflow_dispatch:
+
+concurrency:
+  group: harvest
+  cancel-in-progress: false
+
+jobs:
+  harvest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35          # było 30; twardy limit trochę ponad budżet skryptu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests "psycopg[binary]"
+      - name: Zbierz dane
+        run: python harvest.py
+        env:
+          TRAVELPAYOUTS_TOKEN: ${{ secrets.TRAVELPAYOUTS_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          HARVEST_SKAD: ${{ vars.HARVEST_SKAD || 'WAW' }}
+          HARVEST_BUDZET_MIN: "25"     # skrypt kończy sam po 25 min i zapisuje postęp; następny przebieg wznawia

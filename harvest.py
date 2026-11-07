@@ -206,6 +206,19 @@ def uzupelnij_klimat(sesja, baza_url):
     print("Klimat uzupełniony dla wszystkich lotnisk z kolejki.")
 
 
+def normalizuj_skady(skady, miasta):
+    """Zamienia kody lotnisk na kody miast (LHR, LGW, STN -> LON) i usuwa duplikaty.
+    Aplikacja i wyszukiwarka łączą ceny po kodzie miasta, a zapytanie o miasto obejmuje wszystkie jego lotniska."""
+    wynik = []
+    for kod in skady:
+        miasto = miasta.get(kod) or kod
+        if miasto != kod:
+            print(f"Uwaga: {kod} to lotnisko miasta {miasto}, zbieram pod kodem miasta {miasto}.")
+        if miasto not in wynik:
+            wynik.append(miasto)
+    return wynik
+
+
 def main():
     baza_url = os.environ.get("DATABASE_URL", "")
     if not baza_url:
@@ -220,8 +233,8 @@ def main():
         sys.exit("Brak TRAVELPAYOUTS_TOKEN.")
     skady = [s.strip().upper() for s in (os.environ.get("HARVEST_SKAD") or "WAW").split(",")
              if s.strip()]
-    skady = list(dict.fromkeys(skady))
     miasta = mapa_miast(sesja)
+    skady = normalizuj_skady(skady, miasta)
     mies = miesiace_naprzod(MIESIECY_NAPRZOD)
     dodatkowe = {miasta.get(x) or x for x in DODATKOWE}
 

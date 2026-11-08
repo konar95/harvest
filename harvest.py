@@ -244,6 +244,9 @@ def main():
     with psycopg.connect(baza_url) as conn:
         conn.execute("CREATE TABLE IF NOT EXISTS harvest_pary (skad text NOT NULL, cel text NOT NULL, "
                      "miesiac text NOT NULL, PRIMARY KEY (skad, cel, miesiac))")
+        # kolumny dla drugiego źródła cen (Google Flights, patrz gf_zbieraj.py); harvest rusza tylko wiersze "tp"
+        conn.execute("ALTER TABLE oferty ADD COLUMN IF NOT EXISTS zrodlo text NOT NULL DEFAULT 'tp'")
+        conn.execute("ALTER TABLE oferty ADD COLUMN IF NOT EXISTS pobrano timestamptz NOT NULL DEFAULT now()")
         log = dict(conn.execute("SELECT skad, koniec FROM harvest_log").fetchall())
     # najpierw lotniska nigdy niezebrane, potem te z najstarszymi danymi (rozpoczęte, a niedokończone, są wśród najstarszych)
     skady.sort(key=lambda x: (log.get(x) is not None, log[x].timestamp() if log.get(x) else 0))
@@ -288,7 +291,7 @@ def main():
             # połączenie z bazą otwieramy dopiero teraz, żeby nie trzymać jej "obudzonej" podczas pobierania
             with psycopg.connect(baza_url) as conn:
                 with conn.cursor() as cur:
-                    cur.executemany("DELETE FROM oferty WHERE skad=%s AND cel=%s AND miesiac=%s",
+                    cur.executemany("DELETE FROM oferty WHERE skad=%s AND cel=%s AND miesiac=%s AND zrodlo <> 'google'",
                                     list(wyniki))
                     cur.executemany(
                         "INSERT INTO oferty (skad, cel, cel_lotnisko, miesiac, wylot, powrot, cena, "

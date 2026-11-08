@@ -1,0 +1,30 @@
+name: Google Flights (oferty do bazy)
+
+# Uruchamia się samo co 2 godziny. Gdy Google zablokuje adres GitHuba, skrypt zapisuje w bazie przerwę (6 h)
+# i kolejne przebiegi kończą się od razu; jeśli blokada będzie się powtarzać, użyj gf_harmonogram.ps1 na swoim komputerze.
+on:
+  schedule:
+    - cron: "37 */2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: gf
+  cancel-in-progress: false
+
+jobs:
+  gf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests "psycopg[binary]" playwright
+      - run: python -m playwright install --with-deps chromium
+      - name: Pobierz oferty z Google Flights
+        run: python gf_zbieraj.py --max 60 --budzet-min 25
+        env:
+          TRAVELPAYOUTS_TOKEN: ${{ secrets.TRAVELPAYOUTS_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          HARVEST_SKAD: ${{ vars.HARVEST_SKAD || 'WAW' }}

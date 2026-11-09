@@ -14,7 +14,12 @@ Uruchomienie (u siebie; PowerShell):
 Opcje: --max (zapytań na przebieg, domyślnie 40), --pauza (średnia przerwa w s, domyślnie 10),
        --budzet-min (domyślnie 20), --skad WAW,KRK, --swiezosc-h (domyślnie 24), --horyzont-dni (domyślnie 270),
        --ciagle (po opróżnieniu kolejki czeka 30 s i sprawdza ponownie, aż do końca budżetu), --sucho, --pokaz.
-Przy blokadzie Google skrypt kończy i przez GF_BLOKADA_H godzin (domyślnie 6) nie próbuje ponownie."""
+Przy blokadzie Google skrypt kończy i przez GF_BLOKADA_H godzin (domyślnie 6) nie próbuje ponownie.
+
+Wyłącznik (ten sam co w backendzie): zmienna ZRODLO_GOOGLE=0 albo w bazie
+    INSERT INTO ustawienia (klucz, wartosc) VALUES ('zrodlo_google', '0')
+    ON CONFLICT (klucz) DO UPDATE SET wartosc = EXCLUDED.wartosc, zmieniono = now();
+Wyłączone źródło = skrypt kończy od razu (a w trybie --ciagle przy najbliższym pakiecie), nic nie pobiera."""
 import argparse
 import os
 import random
@@ -25,6 +30,22 @@ import psycopg
 
 import harvest
 from gf import Blokada, Przegladarka, najtansze
+
+NIE = {"0", "off", "nie", "false", "no", "wylaczone", "wyłączone"}
+
+
+def google_wlaczony(baza):
+    """Wyłącznik z backendu: zmienna ZRODLO_GOOGLE (pierwszeństwo) albo ustawienia.zrodlo_google w bazie."""
+    env = os.environ.get("ZRODLO_GOOGLE", "").strip().lower()
+    if env:
+        return env not in NIE
+    try:
+        with psycopg.connect(baza, connect_timeout=10) as conn:
+            r = conn.execute("SELECT wartosc FROM ustawienia WHERE klucz = 'zrodlo_google'").fetchone()
+        return r is None or str(r[0]).strip().lower() not in NIE
+    except Exception:
+        return True      # brak tabeli ustawienia = źródło włączone
+
 
 TABELE = [
     "CREATE TABLE IF NOT EXISTS ceny_google (skad text NOT NULL, cel text NOT NULL, wylot date NOT NULL, "
@@ -140,6 +161,9 @@ def main():
     baza = os.environ.get("DATABASE_URL", "")
     if not baza:
         sys.exit("Brak DATABASE_URL.")
+    if not google_wlaczony(baza):
+        print("Źródło Google jest wyłączone (ZRODLO_GOOGLE / ustawienia.zrodlo_google). Kończę bez pobierania.")
+        return
     surowe = a.skad or os.environ.get("GF_SKAD") or os.environ.get("HARVEST_SKAD") or "WAW"
     skady = harvest.normalizuj_skady([x.strip().upper() for x in surowe.split(",") if x.strip()],
                                      harvest.mapa_miast(harvest.nowa_sesja()))
@@ -180,6 +204,9 @@ def main():
     zapisane = brak = 0
     with Przegladarka(a.pokaz) as br:
         while time.time() < koniec - 30:
+            if not google_wlaczony(baza):
+                print("Źródło Google zostało wyłączone. Kończę.")
+                break
             kol, tanie, razem, pominiete = kolejny_pakiet()
             zadania = kol + tanie
             if not zadania:

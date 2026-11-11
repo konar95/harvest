@@ -223,7 +223,8 @@ def normalizuj_skady(skady, miasta):
 # ---------------- LOTY JEDNOKIERUNKOWE (tryb: wylot z jednego lotniska, powrót na inne) ----------------
 ODSWIEZ_JEDN_H = float(os.environ.get("HARVEST_JEDN_ODSWIEZ_H") or 48)    # po tylu godzinach ponawiamy zebrany odcinek
 UDZIAL_JEDN = float(os.environ.get("HARVEST_JEDN_UDZIAL") or 0.3)         # jaka część budżetu czasu idzie na loty jednokierunkowe
-MAX_PAR_JEDN = int(os.environ.get("OPENJAW_MAX_PAR") or 12)               # maks. liczba par lotnisk (wylot > powrót)
+MAX_PAR_JEDN = int(os.environ.get("OPENJAW_MAX_PAR") or 12)               # maks. liczba par zgłoszonych przez aplikację
+MIESIECY_JEDN = int(os.environ.get("HARVEST_JEDN_MIESIECY") or 6)         # na ile miesięcy do przodu zbieramy loty jednokierunkowe
 TABELE_JEDN = [
     "CREATE TABLE IF NOT EXISTS oferty_jedn (skad text NOT NULL, cel text NOT NULL, skad_lot text, cel_lot text, "
     "miesiac text NOT NULL, dzien date NOT NULL, cena int NOT NULL, przesiadki int, linia text, "
@@ -261,44 +262,57 @@ def pobierz_jedn(sesja, token, skad, cel, m):
     return [(skad, cel, k[1], k[2], m, k[0], c, k[3], linia) for k, (c, linia) in najlepsze.items()]
 
 
-def pary_open_jaw(conn, miasta):
-    """[(skad, powrot)] w kodach miast: z HARVEST_OPENJAW ("WAW>KTW,WAW>WRO") i z próśb zgłoszonych przez aplikację."""
-    pary = []
+def pary_open_jaw(conn, miasta, skady):
+    """([wszystkie pary], [pary priorytetowe]) jako (skad, powrot) w kodach miast.
+    Wszystkie pary: każde miasto z HARVEST_SKAD jako wylot i jako powrót (n * (n-1) par). Priorytetowe: z zapytań
+    zgłoszonych przez aplikację (tabela openjaw_pary) oraz z opcjonalnej zmiennej HARVEST_OPENJAW ("WAW>KTW,...")."""
+    priorytet = []
+    for a, b in conn.execute("SELECT skad, powrot FROM openjaw_pary ORDER BY prosba DESC LIMIT %s",
+                             (MAX_PAR_JEDN,)).fetchall():
+        priorytet.append((a, b))
     for p in (os.environ.get("HARVEST_OPENJAW") or "").split(","):
         if ">" in p:
             a, b = (x.strip().upper() for x in p.split(">", 1))
             if len(a) == 3 and len(b) == 3:
-                pary.append((miasta.get(a) or a, miasta.get(b) or b))
-    for a, b in conn.execute("SELECT skad, powrot FROM openjaw_pary ORDER BY prosba DESC LIMIT %s",
-                             (MAX_PAR_JEDN,)).fetchall():
-        pary.append((a, b))
-    return [p for p in dict.fromkeys(pary) if p[0] != p[1]][:MAX_PAR_JEDN * 2]
+                priorytet.append((miasta.get(a) or a, miasta.get(b) or b))
+    wszystkie = [(a, b) for a in skady for b in skady if a != b]
+    priorytet = [p for p in dict.fromkeys(priorytet) if p[0] != p[1]]
+    return list(dict.fromkeys(priorytet + wszystkie)), priorytet
 
 
-def zbierz_jednokierunkowe(sesja, token, baza_url, miasta, mies, koniec):
-    """Zbiera odcinki skad->cel i cel->powrot dla par z pary_open_jaw. Wznawialne; kończy po przekroczeniu `koniec`."""
+def zbierz_jednokierunkowe(sesja, token, baza_url, miasta, mies, koniec, skady=()):
+    """Zbiera odcinki skad->cel i cel->powrot dla wszystkich par miast z HARVEST_SKAD oraz par zgłoszonych przez
+    aplikację. Odcinki nie zależą od pary (skad->cel liczy się raz), więc koszt rośnie liniowo z liczbą lotnisk.
+    Kolejność: odcinki par z aplikacji, potem nigdy niepobrane, potem najstarsze. Wznawialne; kończy po `koniec`."""
+    mies = list(mies)[:MIESIECY_JEDN]
     with psycopg.connect(baza_url) as conn:
         for sql in TABELE_JEDN:
             conn.execute(sql)
-        pary = pary_open_jaw(conn, miasta)
+        pary, priorytet = pary_open_jaw(conn, miasta, list(skady))
         if not pary:
+            print("[jednokierunkowe] brak lotnisk w HARVEST_SKAD (potrzeba co najmniej dwóch) i brak zgłoszonych par.")
             return
-        odcinki = set()
-        for a, b in pary:
-            cele = [r[0] for r in conn.execute(
+        odcinki, odcinki_prio = set(), set()
+        cele_z = {}
+        for a in {p[0] for p in pary}:
+            cele_z[a] = [r[0] for r in conn.execute(
                 "SELECT DISTINCT cel FROM oferty WHERE skad=%s AND zrodlo='tp'", (a,)).fetchall()]
-            for x in cele:
+        for a, b in pary:
+            for x in cele_z.get(a, []):
                 if x in (a, b):
                     continue
                 for m in mies:
                     odcinki.add((a, x, m))
                     odcinki.add((x, b, m))
-        swieze = set(conn.execute(
-            "SELECT skad, cel, miesiac FROM harvest_jedn WHERE pobrano > now() - make_interval(secs => %s::int)",
-            (int(ODSWIEZ_JEDN_H * 3600),)).fetchall())
-    do_zrobienia = sorted(o for o in odcinki if o not in swieze)
-    print(f"[jednokierunkowe] pary: {', '.join(a + '>' + b for a, b in pary)}; odcinków: {len(odcinki)}, "
-          f"do pobrania: {len(do_zrobienia)}")
+                    if (a, b) in priorytet:
+                        odcinki_prio.update({(a, x, m), (x, b, m)})
+        pobrano = {(s, c, m): t.timestamp() for s, c, m, t in conn.execute(
+            "SELECT skad, cel, miesiac, pobrano FROM harvest_jedn").fetchall()}
+    prog = time.time() - ODSWIEZ_JEDN_H * 3600
+    do_zrobienia = sorted((o for o in odcinki if pobrano.get(o, 0) < prog),
+                          key=lambda o: (o not in odcinki_prio, pobrano.get(o, 0), o))
+    print(f"[jednokierunkowe] pary: {len(pary)} (z aplikacji lub HARVEST_OPENJAW: {len(priorytet)}), "
+          f"miesięcy: {len(mies)}, odcinków: {len(odcinki)}, do pobrania: {len(do_zrobienia)}")
     zrobione = bledy = 0
     for i in range(0, len(do_zrobienia), PACZKA):
         if time.time() > koniec - MARGINES_PACZKI:
@@ -355,7 +369,7 @@ def main():
     print(f"Kolejność lotnisk ({len(skady)}): {', '.join(skady)}. Budżet czasu: {BUDZET_MIN:g} min.")
     try:        # loty jednokierunkowe (tryb z powrotem na inne lotnisko): własny, ograniczony udział czasu
         zbierz_jednokierunkowe(sesja, token, baza_url, miasta, mies,
-                               min(koniec_budzetu, time.time() + UDZIAL_JEDN * BUDZET_MIN * 60))
+                               min(koniec_budzetu, time.time() + UDZIAL_JEDN * BUDZET_MIN * 60), skady)
     except SystemExit:
         raise
     except Exception as e:

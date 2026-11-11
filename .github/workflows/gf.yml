@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   gf:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
     steps:
       - uses: actions/checkout@v4
@@ -21,7 +21,14 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install requests "psycopg[binary]" playwright
-      - run: python -m playwright install --with-deps chromium
+      - name: Zainstaluj Chromium (z ponowieniami; bez apt, jeśli sieć apt nie działa)
+        run: |
+          for i in 1 2 3; do
+            python -m playwright install --with-deps chromium && exit 0
+            echo "Próba $i nieudana (apt?), ponawiam za 20 s"; sleep 20
+          done
+          echo "Instaluję samą przeglądarkę bez pakietów systemowych"
+          python -m playwright install chromium
       - name: Pobierz oferty z Google Flights
         run: python gf_zbieraj.py --max 60 --budzet-min 25
         env:

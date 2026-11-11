@@ -2,7 +2,7 @@ name: Harvest cen
 
 on:
   schedule:
-    - cron: "7 */2 * * *"        # było co 6 godzin; częściej = szybciej kończy się pełny cykl lotnisk
+    - cron: "7 */3 * * *"        # było co 6 godzin; częściej = szybciej kończy się pełny cykl lotnisk
   workflow_dispatch:
 
 concurrency:
@@ -25,4 +25,5 @@ jobs:
           TRAVELPAYOUTS_TOKEN: ${{ secrets.TRAVELPAYOUTS_TOKEN }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           HARVEST_SKAD: ${{ vars.HARVEST_SKAD || 'WAW' }}
+          HARVEST_OPENJAW: ${{ vars.HARVEST_OPENJAW || '' }}   # pary wylot>powrót, np. WAW>KTW,WAW>WRO
           HARVEST_BUDZET_MIN: "25"     # skrypt kończy sam po 25 min i zapisuje postęp; następny przebieg wznawia

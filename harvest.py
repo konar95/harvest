@@ -131,11 +131,12 @@ def pobierz(sesja, token, skad, cel, m):
     return wiersze
 
 
-def wykonaj(sesja, token, zadania, watki):
+def wykonaj(sesja, token, zadania, watki, funkcja=None):
     """Zwraca ({zadanie: lista ofert}, [nieudane zadania])."""
+    funkcja = funkcja or pobierz
     wyniki, nieudane = {}, []
     with ThreadPoolExecutor(max_workers=watki) as ex:
-        przyszle = {ex.submit(pobierz, sesja, token, *z): z for z in zadania}
+        przyszle = {ex.submit(funkcja, sesja, token, *z): z for z in zadania}
         for f in as_completed(przyszle):
             z = przyszle[f]
             try:
@@ -219,6 +220,107 @@ def normalizuj_skady(skady, miasta):
     return wynik
 
 
+# ---------------- LOTY JEDNOKIERUNKOWE (tryb: wylot z jednego lotniska, powrót na inne) ----------------
+ODSWIEZ_JEDN_H = float(os.environ.get("HARVEST_JEDN_ODSWIEZ_H") or 48)    # po tylu godzinach ponawiamy zebrany odcinek
+UDZIAL_JEDN = float(os.environ.get("HARVEST_JEDN_UDZIAL") or 0.3)         # jaka część budżetu czasu idzie na loty jednokierunkowe
+MAX_PAR_JEDN = int(os.environ.get("OPENJAW_MAX_PAR") or 12)               # maks. liczba par lotnisk (wylot > powrót)
+TABELE_JEDN = [
+    "CREATE TABLE IF NOT EXISTS oferty_jedn (skad text NOT NULL, cel text NOT NULL, skad_lot text, cel_lot text, "
+    "miesiac text NOT NULL, dzien date NOT NULL, cena int NOT NULL, przesiadki int, linia text, "
+    "pobrano timestamptz NOT NULL DEFAULT now())",
+    "CREATE INDEX IF NOT EXISTS oferty_jedn_idx ON oferty_jedn (skad, cel, miesiac)",
+    "CREATE TABLE IF NOT EXISTS harvest_jedn (skad text NOT NULL, cel text NOT NULL, miesiac text NOT NULL, "
+    "pobrano timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (skad, cel, miesiac))",
+    "CREATE TABLE IF NOT EXISTS openjaw_pary (skad text NOT NULL, powrot text NOT NULL, "
+    "prosba timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (skad, powrot))",
+]
+
+
+def pobierz_jedn(sesja, token, skad, cel, m):
+    """Najtańsze loty w jedną stronę skad -> cel w danym miesiącu. Zwraca wiersze do tabeli oferty_jedn."""
+    r = zapytaj(sesja, URL_CEN, {
+        "origin": skad, "destination": cel, "departure_at": m, "one_way": "true",
+        "unique": "false", "sorting": "price", "direct": "false", "currency": WALUTA,
+        "limit": 1000, "token": token}, proby=2, pauza=15)
+    if r.status_code in (401, 403):
+        raise BladTokenu("Token Travelpayouts odrzucony")
+    r.raise_for_status()
+    najlepsze = {}
+    for o in r.json().get("data") or []:
+        if o.get("price") is None:
+            continue
+        try:
+            dzien = date.fromisoformat(str(o["departure_at"])[:10])
+        except (KeyError, ValueError):
+            continue
+        klucz = (dzien, o.get("origin_airport"), o.get("destination_airport"), o.get("transfers") or 0)
+        cena = int(round(o["price"]))
+        if klucz not in najlepsze or cena < najlepsze[klucz][0]:
+            najlepsze[klucz] = (cena, o.get("airline"))
+    time.sleep(0.1)
+    return [(skad, cel, k[1], k[2], m, k[0], c, k[3], linia) for k, (c, linia) in najlepsze.items()]
+
+
+def pary_open_jaw(conn, miasta):
+    """[(skad, powrot)] w kodach miast: z HARVEST_OPENJAW ("WAW>KTW,WAW>WRO") i z próśb zgłoszonych przez aplikację."""
+    pary = []
+    for p in (os.environ.get("HARVEST_OPENJAW") or "").split(","):
+        if ">" in p:
+            a, b = (x.strip().upper() for x in p.split(">", 1))
+            if len(a) == 3 and len(b) == 3:
+                pary.append((miasta.get(a) or a, miasta.get(b) or b))
+    for a, b in conn.execute("SELECT skad, powrot FROM openjaw_pary ORDER BY prosba DESC LIMIT %s",
+                             (MAX_PAR_JEDN,)).fetchall():
+        pary.append((a, b))
+    return [p for p in dict.fromkeys(pary) if p[0] != p[1]][:MAX_PAR_JEDN * 2]
+
+
+def zbierz_jednokierunkowe(sesja, token, baza_url, miasta, mies, koniec):
+    """Zbiera odcinki skad->cel i cel->powrot dla par z pary_open_jaw. Wznawialne; kończy po przekroczeniu `koniec`."""
+    with psycopg.connect(baza_url) as conn:
+        for sql in TABELE_JEDN:
+            conn.execute(sql)
+        pary = pary_open_jaw(conn, miasta)
+        if not pary:
+            return
+        odcinki = set()
+        for a, b in pary:
+            cele = [r[0] for r in conn.execute(
+                "SELECT DISTINCT cel FROM oferty WHERE skad=%s AND zrodlo='tp'", (a,)).fetchall()]
+            for x in cele:
+                if x in (a, b):
+                    continue
+                for m in mies:
+                    odcinki.add((a, x, m))
+                    odcinki.add((x, b, m))
+        swieze = set(conn.execute(
+            "SELECT skad, cel, miesiac FROM harvest_jedn WHERE pobrano > now() - make_interval(secs => %s::int)",
+            (int(ODSWIEZ_JEDN_H * 3600),)).fetchall())
+    do_zrobienia = sorted(o for o in odcinki if o not in swieze)
+    print(f"[jednokierunkowe] pary: {', '.join(a + '>' + b for a, b in pary)}; odcinków: {len(odcinki)}, "
+          f"do pobrania: {len(do_zrobienia)}")
+    zrobione = bledy = 0
+    for i in range(0, len(do_zrobienia), PACZKA):
+        if time.time() > koniec - MARGINES_PACZKI:
+            print("[jednokierunkowe] budżet czasu wyczerpany, resztę pobiorę w następnym uruchomieniu.")
+            break
+        paczka = do_zrobienia[i:i + PACZKA]
+        wyniki, nieudane = wykonaj(sesja, token, paczka, WATKI, pobierz_jedn)
+        bledy += len(nieudane)
+        with psycopg.connect(baza_url) as conn:
+            with conn.cursor() as cur:
+                cur.executemany("DELETE FROM oferty_jedn WHERE skad=%s AND cel=%s AND miesiac=%s", list(wyniki))
+                cur.executemany(
+                    "INSERT INTO oferty_jedn (skad, cel, skad_lot, cel_lot, miesiac, dzien, cena, przesiadki, linia) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)", [w for l in wyniki.values() for w in l])
+                cur.executemany(
+                    "INSERT INTO harvest_jedn (skad, cel, miesiac, pobrano) VALUES (%s,%s,%s, now()) "
+                    "ON CONFLICT (skad, cel, miesiac) DO UPDATE SET pobrano = now()", list(wyniki))
+                cur.execute("DELETE FROM oferty_jedn WHERE dzien < current_date")
+        zrobione += len(wyniki)
+        print(f"[jednokierunkowe] zapisano {zrobione}/{len(do_zrobienia)} (błędów: {bledy})")
+
+
 def main():
     baza_url = os.environ.get("DATABASE_URL", "")
     if not baza_url:
@@ -251,6 +353,13 @@ def main():
     # najpierw lotniska nigdy niezebrane, potem te z najstarszymi danymi (rozpoczęte, a niedokończone, są wśród najstarszych)
     skady.sort(key=lambda x: (log.get(x) is not None, log[x].timestamp() if log.get(x) else 0))
     print(f"Kolejność lotnisk ({len(skady)}): {', '.join(skady)}. Budżet czasu: {BUDZET_MIN:g} min.")
+    try:        # loty jednokierunkowe (tryb z powrotem na inne lotnisko): własny, ograniczony udział czasu
+        zbierz_jednokierunkowe(sesja, token, baza_url, miasta, mies,
+                               min(koniec_budzetu, time.time() + UDZIAL_JEDN * BUDZET_MIN * 60))
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"[jednokierunkowe] pominięto z powodu błędu: {type(e).__name__}: {e}")
 
     for skad in skady:
         if time.time() > koniec_budzetu - MARGINES_LOTNISKA:
@@ -291,7 +400,7 @@ def main():
             # połączenie z bazą otwieramy dopiero teraz, żeby nie trzymać jej "obudzonej" podczas pobierania
             with psycopg.connect(baza_url) as conn:
                 with conn.cursor() as cur:
-                    cur.executemany("DELETE FROM oferty WHERE skad=%s AND cel=%s AND miesiac=%s AND zrodlo <> 'google'",
+                    cur.executemany("DELETE FROM oferty WHERE skad=%s AND cel=%s AND miesiac=%s AND zrodlo = 'tp'",
                                     list(wyniki))
                     cur.executemany(
                         "INSERT INTO oferty (skad, cel, cel_lotnisko, miesiac, wylot, powrot, cena, "

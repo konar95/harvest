@@ -2,6 +2,9 @@
 
 python harvest.py            - zbiera ceny (uruchamia GitHub Actions)
 python harvest.py --klimat   - uzupełnia klimat lotnisk (uruchamiaj lokalnie; można przerwać i wznowić)
+
+Przy zbieraniu cen zapisuje też historię cen (tabela historia_cen, do trendów) i oferty specjalne (tabela okazje).
+Zmienne opcjonalne: HISTORIA_DNI (domyślnie 120), HARVEST_OKAZJE=0 (wyłącza oferty specjalne), TP_MARKET (np. pl).
 """
 import csv
 import io
@@ -34,8 +37,82 @@ DODATKOWE = [
 ]
 
 
+URL_OKAZJI = "https://api.travelpayouts.com/aviasales/v3/get_special_offers"
+HISTORIA_DNI = int(os.environ.get("HISTORIA_DNI") or 120)             # tyle dni trzymamy historię cen
+OKAZJE_WLACZONE = (os.environ.get("HARVEST_OKAZJE") or "1") != "0"   # 0 = nie zbieraj ofert specjalnych
+TP_MARKET = (os.environ.get("TP_MARKET") or "").strip()               # opcjonalny rynek danych dla ofert specjalnych, np. pl
+TABELE_CEN = [
+    # najniższa cena dnia dla pary skąd-dokąd i miesiąca wylotu; wiersz powstaje tylko, gdy cena się zmieniła
+    "CREATE TABLE IF NOT EXISTS historia_cen (skad text NOT NULL, cel text NOT NULL, miesiac text NOT NULL, "
+    "dzien date NOT NULL DEFAULT current_date, cena int NOT NULL, PRIMARY KEY (skad, cel, miesiac, dzien))",
+    "CREATE TABLE IF NOT EXISTS okazje (skad text NOT NULL, cel text NOT NULL, cel_lotnisko text, cel_nazwa text, "
+    "wylot date, powrot date, cena int NOT NULL, linia text, tytul text, link text, "
+    "pobrano timestamptz NOT NULL DEFAULT now())",
+    "CREATE INDEX IF NOT EXISTS okazje_idx ON okazje (skad, cena)",
+]
+# Zapis historii: jeden wiersz na dzień i tylko wtedy, gdy cena różni się od ostatnio zapisanej (oszczędność miejsca).
+SQL_HISTORIA = (
+    "INSERT INTO historia_cen (skad, cel, miesiac, dzien, cena) "
+    "SELECT n.skad, n.cel, n.miesiac, current_date, n.cena FROM ("
+    "  SELECT skad, cel, miesiac, min(cena) AS cena FROM oferty "
+    "  WHERE skad = %s AND cel = ANY(%s) AND wylot >= current_date GROUP BY skad, cel, miesiac) n "
+    "LEFT JOIN LATERAL (SELECT h.cena, h.dzien FROM historia_cen h WHERE h.skad = n.skad AND h.cel = n.cel "
+    "  AND h.miesiac = n.miesiac ORDER BY h.dzien DESC LIMIT 1) p ON true "
+    "WHERE p.cena IS DISTINCT FROM n.cena OR p.dzien = current_date "
+    "ON CONFLICT (skad, cel, miesiac, dzien) DO UPDATE SET cena = LEAST(historia_cen.cena, EXCLUDED.cena)")
+
+
 class BladTokenu(Exception):
     pass
+
+
+def _data(tekst):
+    try:
+        return date.fromisoformat(str(tekst)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def zbierz_okazje(sesja, token, baza_url, skady, miasta):
+    """Oferty specjalne Travelpayouts (nietypowo niskie ceny) dla każdego lotniska wylotu: jedno zapytanie na lotnisko.
+    Błąd jednego lotniska nie przerywa pozostałych; stare okazje danego lotniska zastępujemy nowymi."""
+    razem = 0
+    for skad in skady:
+        params = {"origin": skad, "currency": WALUTA, "token": token}
+        if TP_MARKET:
+            params["market"] = TP_MARKET
+        try:
+            r = zapytaj(sesja, URL_OKAZJI, params, proby=2, pauza=15)
+        except Exception as e:
+            print(f"[okazje] {skad}: {type(e).__name__}, pomijam")
+            continue
+        if r.status_code in (401, 403):
+            raise BladTokenu("Token Travelpayouts odrzucony")
+        if r.status_code != 200:
+            print(f"[okazje] {skad}: HTTP {r.status_code}, pomijam")
+            continue
+        try:
+            dane = r.json().get("data") or []
+        except ValueError:
+            dane = []
+        wiersze = []
+        for o in dane:
+            cel, cena, wylot = o.get("destination"), o.get("price"), _data(o.get("departure_at"))
+            if not cel or cena is None or wylot is None or wylot < date.today():
+                continue
+            link = str(o.get("link") or "")
+            wiersze.append((skad, miasta.get(cel) or cel, o.get("destination_airport"), o.get("destination_name"),
+                            wylot, _data(o.get("return_at")), int(round(cena)), o.get("airline"),
+                            str(o.get("title") or "")[:200], link[:500]))
+        with psycopg.connect(baza_url) as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM okazje WHERE skad = %s", (skad,))
+                cur.executemany(
+                    "INSERT INTO okazje (skad, cel, cel_lotnisko, cel_nazwa, wylot, powrot, cena, linia, tytul, link) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", wiersze)
+        razem += len(wiersze)
+        time.sleep(0.3)
+    print(f"[okazje] zapisano {razem} ofert specjalnych dla {len(skady)} lotnisk")
 
 
 def nowa_sesja():
@@ -368,6 +445,10 @@ def main():
         # kolumny dla drugiego źródła cen (Google Flights, patrz gf_zbieraj.py); harvest rusza tylko wiersze "tp"
         conn.execute("ALTER TABLE oferty ADD COLUMN IF NOT EXISTS zrodlo text NOT NULL DEFAULT 'tp'")
         conn.execute("ALTER TABLE oferty ADD COLUMN IF NOT EXISTS pobrano timestamptz NOT NULL DEFAULT now()")
+        for sql in TABELE_CEN:                      # historia cen i oferty specjalne
+            conn.execute(sql)
+        conn.execute("DELETE FROM historia_cen WHERE dzien < current_date - %s::int "
+                     "OR miesiac < to_char(current_date, 'YYYY-MM')", (HISTORIA_DNI,))
         log = dict(conn.execute("SELECT skad, koniec FROM harvest_log").fetchall())
     # najpierw lotniska nigdy niezebrane, potem te z najstarszymi danymi (rozpoczęte, a niedokończone, są wśród najstarszych)
     skady.sort(key=lambda x: (log.get(x) is not None, log[x].timestamp() if log.get(x) else 0))
@@ -379,6 +460,14 @@ def main():
         raise
     except Exception as e:
         print(f"[jednokierunkowe] pominięto z powodu błędu: {type(e).__name__}: {e}")
+
+    if OKAZJE_WLACZONE:
+        try:        # oferty specjalne: jedno zapytanie na lotnisko, nie obciąża budżetu czasu
+            zbierz_okazje(sesja, token, baza_url, skady, miasta)
+        except BladTokenu as e:
+            sys.exit(str(e))
+        except Exception as e:
+            print(f"[okazje] pominięto z powodu błędu: {type(e).__name__}: {e}")
 
     for skad in skady:
         if time.time() > koniec_budzetu - MARGINES_LOTNISKA:
@@ -428,6 +517,9 @@ def main():
                     cur.executemany("INSERT INTO harvest_pary (skad, cel, miesiac) VALUES (%s,%s,%s) "
                                     "ON CONFLICT DO NOTHING", list(wyniki))
                     cur.execute("DELETE FROM oferty WHERE wylot < current_date")
+                    # historia cen: najniższa dzisiejsza cena dla kierunków z tej paczki (wszystkie źródła cen)
+                    if wyniki:
+                        cur.execute(SQL_HISTORIA, (skad, sorted({z[1] for z in wyniki})))
             print(f"[{skad}] zapisano {min(i + PACZKA, len(do_zrobienia))}/{len(do_zrobienia)} "
                   f"(błędów: {bledy}, {time.time() - t0:.0f} s)")
 

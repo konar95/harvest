@@ -26,7 +26,12 @@ MARGINES_PACZKI = 45                   # nie zaczynamy nowej paczki zapytań, gd
 PACZKA = int(os.environ.get("HARVEST_PACZKA") or 150)             # tyle zapytań zapisujemy do bazy naraz
 BAZA_LOTNISK = "https://raw.githubusercontent.com/jpatokal/openflights/master/data/airports.dat"
 # kierunki zawsze zbierane (kody lotnisk), niezależnie od tego, czy baza cen je poleca
-DODATKOWE = ["TOS", "RVN", "KRN", "KEF", "ALF", "KTT", "IVL", "LYR"]
+DODATKOWE = [
+    # północ, kierunki zorzy polarnej i Laponii (dotychczasowe)
+    "TOS", "RVN", "KRN", "KEF", "ALF", "KTT", "IVL", "LYR",
+    # popularne połączenia z Polski: Szwecja, Norwegia, Finlandia (bez lotów krajowych)
+    "ARN", "GOT", "OSL", "TRF", "BGO", "SVG", "TRD", "AES", "BOO", "HEL",
+]
 
 
 class BladTokenu(Exception):

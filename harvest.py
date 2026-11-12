@@ -42,7 +42,7 @@ URL_OKAZJI = "https://api.travelpayouts.com/aviasales/v3/get_special_offers"
 HISTORIA_DNI = int(os.environ.get("HISTORIA_DNI") or 120)             # tyle dni trzymamy historię cen
 OKAZJE_WLACZONE = (os.environ.get("HARVEST_OKAZJE") or "1") != "0"   # 0 = nie zbieraj ofert specjalnych
 TP_MARKET = (os.environ.get("TP_MARKET") or "").strip()               # opcjonalny rynek danych dla ofert specjalnych, np. pl
-OKAZJE_MIN_DNI = int(os.environ.get("OKAZJE_MIN_DNI") or 3)           # okazje tylko w obie strony, z pobytem od-do dni
+OKAZJE_MIN_DNI = int(os.environ.get("OKAZJE_MIN_DNI") or 3)           # okazje w obie strony: pobyt od-do dni
 OKAZJE_MAX_DNI = int(os.environ.get("OKAZJE_MAX_DNI") or 7)
 OKAZJE_PROG = float(os.environ.get("OKAZJE_PROG") or 0.7)              # okazja z bazy: cena <= 70% mediany dla kierunku
 # Okazje z własnej bazy ofert: najtańszy lot na kierunek z pobytem 3-7 dni, wyraźnie poniżej typowej ceny tego kierunku.
@@ -119,8 +119,8 @@ def zbierz_okazje(sesja, token, baza_url, skady, miasta):
             powrot = _data(o.get("return_at"))
             if not cel or cena is None or wylot is None or wylot < date.today():
                 continue
-            if powrot is None or not OKAZJE_MIN_DNI <= (powrot - wylot).days <= OKAZJE_MAX_DNI:
-                continue                    # tylko w obie strony, z pobytem 3-7 dni
+            if powrot is not None and not OKAZJE_MIN_DNI <= (powrot - wylot).days <= OKAZJE_MAX_DNI:
+                continue                    # w obie strony tylko z pobytem 3-7 dni; w jedną stronę zostają jako zapas
             link = str(o.get("link") or "")
             wiersze.append((skad, miasta.get(cel) or cel, o.get("destination_airport"), o.get("destination_name"),
                             wylot, powrot, int(round(cena)), o.get("airline"),

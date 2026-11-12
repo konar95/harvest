@@ -4,7 +4,8 @@ python harvest.py            - zbiera ceny (uruchamia GitHub Actions)
 python harvest.py --klimat   - uzupełnia klimat lotnisk (uruchamiaj lokalnie; można przerwać i wznowić)
 
 Przy zbieraniu cen zapisuje też historię cen (tabela historia_cen, do trendów) i oferty specjalne (tabela okazje).
-Zmienne opcjonalne: HISTORIA_DNI (domyślnie 120), HARVEST_OKAZJE=0 (wyłącza oferty specjalne), TP_MARKET (np. pl).
+Zmienne opcjonalne: HISTORIA_DNI (domyślnie 120), HARVEST_OKAZJE=0 (wyłącza okazje), TP_MARKET (np. pl),
+OKAZJE_MIN_DNI i OKAZJE_MAX_DNI (pobyt, domyślnie 3-7), OKAZJE_PROG (domyślnie 0.7 mediany ceny kierunku).
 """
 import csv
 import io
@@ -41,6 +42,22 @@ URL_OKAZJI = "https://api.travelpayouts.com/aviasales/v3/get_special_offers"
 HISTORIA_DNI = int(os.environ.get("HISTORIA_DNI") or 120)             # tyle dni trzymamy historię cen
 OKAZJE_WLACZONE = (os.environ.get("HARVEST_OKAZJE") or "1") != "0"   # 0 = nie zbieraj ofert specjalnych
 TP_MARKET = (os.environ.get("TP_MARKET") or "").strip()               # opcjonalny rynek danych dla ofert specjalnych, np. pl
+OKAZJE_MIN_DNI = int(os.environ.get("OKAZJE_MIN_DNI") or 3)           # okazje tylko w obie strony, z pobytem od-do dni
+OKAZJE_MAX_DNI = int(os.environ.get("OKAZJE_MAX_DNI") or 7)
+OKAZJE_PROG = float(os.environ.get("OKAZJE_PROG") or 0.7)              # okazja z bazy: cena <= 70% mediany dla kierunku
+# Okazje z własnej bazy ofert: najtańszy lot na kierunek z pobytem 3-7 dni, wyraźnie poniżej typowej ceny tego kierunku.
+SQL_OKAZJE_Z_BAZY = (
+    "INSERT INTO okazje (skad, cel, cel_lotnisko, wylot, powrot, cena, linia, tytul) "
+    "SELECT skad, cel, cel_lotnisko, wylot, powrot, cena, linia, 'baza' FROM ("
+    "  SELECT DISTINCT ON (o.cel) o.skad, o.cel, o.cel_lotnisko, o.wylot, o.powrot, o.cena, o.linia "
+    "  FROM oferty o JOIN ("
+    "    SELECT cel, percentile_cont(0.5) WITHIN GROUP (ORDER BY cena) AS mediana, count(*) AS n FROM oferty "
+    "    WHERE skad = %(s)s AND wylot >= current_date + 3 AND powrot - wylot BETWEEN %(od)s AND %(do)s GROUP BY cel"
+    "  ) m ON m.cel = o.cel "
+    "  WHERE o.skad = %(s)s AND o.wylot >= current_date + 3 AND o.powrot - o.wylot BETWEEN %(od)s AND %(do)s "
+    "    AND m.n >= 5 AND o.cena <= %(prog)s * m.mediana "
+    "  ORDER BY o.cel, o.cena) x "
+    "ORDER BY cena LIMIT 40")
 TABELE_CEN = [
     # najniższa cena dnia dla pary skąd-dokąd i miesiąca wylotu; wiersz powstaje tylko, gdy cena się zmieniła
     "CREATE TABLE IF NOT EXISTS historia_cen (skad text NOT NULL, cel text NOT NULL, miesiac text NOT NULL, "
@@ -84,25 +101,29 @@ def zbierz_okazje(sesja, token, baza_url, skady, miasta):
         try:
             r = zapytaj(sesja, URL_OKAZJI, params, proby=2, pauza=15)
         except Exception as e:
-            print(f"[okazje] {skad}: {type(e).__name__}, pomijam")
-            continue
-        if r.status_code in (401, 403):
+            print(f"[okazje] {skad}: {type(e).__name__}, biorę tylko okazje z własnej bazy")
+            r = None
+        if r is not None and r.status_code in (401, 403):
             raise BladTokenu("Token Travelpayouts odrzucony")
-        if r.status_code != 200:
-            print(f"[okazje] {skad}: HTTP {r.status_code}, pomijam")
-            continue
-        try:
-            dane = r.json().get("data") or []
-        except ValueError:
-            dane = []
+        dane = []
+        if r is not None and r.status_code == 200:
+            try:
+                dane = r.json().get("data") or []
+            except ValueError:
+                dane = []
+        elif r is not None:
+            print(f"[okazje] {skad}: HTTP {r.status_code}, biorę tylko okazje z własnej bazy")
         wiersze = []
         for o in dane:
             cel, cena, wylot = o.get("destination"), o.get("price"), _data(o.get("departure_at"))
+            powrot = _data(o.get("return_at"))
             if not cel or cena is None or wylot is None or wylot < date.today():
                 continue
+            if powrot is None or not OKAZJE_MIN_DNI <= (powrot - wylot).days <= OKAZJE_MAX_DNI:
+                continue                    # tylko w obie strony, z pobytem 3-7 dni
             link = str(o.get("link") or "")
             wiersze.append((skad, miasta.get(cel) or cel, o.get("destination_airport"), o.get("destination_name"),
-                            wylot, _data(o.get("return_at")), int(round(cena)), o.get("airline"),
+                            wylot, powrot, int(round(cena)), o.get("airline"),
                             str(o.get("title") or "")[:200], link[:500]))
         with psycopg.connect(baza_url) as conn:
             with conn.cursor() as cur:
@@ -110,9 +131,13 @@ def zbierz_okazje(sesja, token, baza_url, skady, miasta):
                 cur.executemany(
                     "INSERT INTO okazje (skad, cel, cel_lotnisko, cel_nazwa, wylot, powrot, cena, linia, tytul, link) "
                     "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", wiersze)
-        razem += len(wiersze)
+                cur.execute(SQL_OKAZJE_Z_BAZY, {"s": skad, "od": OKAZJE_MIN_DNI, "do": OKAZJE_MAX_DNI,
+                                                "prog": OKAZJE_PROG})
+                z_bazy = cur.rowcount
+        razem += len(wiersze) + max(z_bazy, 0)
         time.sleep(0.3)
-    print(f"[okazje] zapisano {razem} ofert specjalnych dla {len(skady)} lotnisk")
+    print(f"[okazje] zapisano {razem} okazji (oferty specjalne i z własnej bazy, pobyt {OKAZJE_MIN_DNI}-{OKAZJE_MAX_DNI} dni) "
+          f"dla {len(skady)} lotnisk")
 
 
 def nowa_sesja():

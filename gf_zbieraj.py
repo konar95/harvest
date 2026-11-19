@@ -95,18 +95,27 @@ def z_kolejki(conn, maks, swiezosc_h):
         (maks,)).fetchall()
 
 
-def najtansze_z_bazy(conn, skady, maks, swiezosc_h, horyzont):
-    """Dla każdej trasy najtańsza oferta z bazy, bez sprawdzonych niedawno; najtańsze pierwsze."""
-    wiersze = conn.execute(
-        "SELECT DISTINCT ON (o.skad, o.cel) o.skad, o.cel, o.cel_lotnisko, o.wylot, o.powrot, o.cena "
-        "FROM oferty o WHERE o.skad = ANY(%s) AND o.wylot >= current_date + 7 "
-        "AND o.wylot <= current_date + %s::int ORDER BY o.skad, o.cel, o.cena", (list(skady), horyzont)).fetchall()
-    swieze = set(conn.execute(
-        "SELECT skad, cel, wylot, powrot FROM ceny_google "
-        "WHERE pobrano > now() - make_interval(hours => %s::int)", (swiezosc_h,)).fetchall())
-    cele = [w for w in wiersze if (w[0], w[1], w[3], w[4]) not in swieze]
-    cele.sort(key=lambda w: w[5])
-    return cele[:maks], len(wiersze), len(wiersze) - len(cele)
+_SQL_TRASY = (
+    "FROM (SELECT DISTINCT ON (o.skad, o.cel) o.skad, o.cel, o.cel_lotnisko, o.wylot, o.powrot, o.cena "
+    "      FROM oferty o WHERE o.skad = ANY(%(s)s) AND o.wylot >= current_date + 7 "
+    "      AND o.wylot <= current_date + %(h)s::int ORDER BY o.skad, o.cel, o.cena) t ")
+_SQL_SWIEZA = ("EXISTS (SELECT 1 FROM ceny_google g WHERE g.skad=t.skad AND g.cel=t.cel AND g.wylot=t.wylot "
+               "AND g.powrot=t.powrot AND g.pobrano > now() - make_interval(hours => %(sw)s::int))")
+
+
+def najtansze_z_bazy(conn, skady, maks, swiezosc_h, horyzont, liczniki=False):
+    """Dla każdej trasy najtańsza oferta z bazy, bez sprawdzonych niedawno; najtańsze pierwsze.
+    Filtrowanie i LIMIT robi baza, więc odsyła tylko `maks` wierszy (oszczędność transferu Neon).
+    Liczniki tras (do --sucho) liczone tylko na życzenie."""
+    par = {"s": list(skady), "h": horyzont, "sw": swiezosc_h, "m": maks}
+    cele = conn.execute(
+        "SELECT t.skad, t.cel, t.cel_lotnisko, t.wylot, t.powrot, t.cena " + _SQL_TRASY +
+        "WHERE NOT " + _SQL_SWIEZA + " ORDER BY t.cena LIMIT %(m)s::int", par).fetchall()
+    razem = pominiete = 0
+    if liczniki:
+        razem, pominiete = conn.execute(
+            "SELECT count(*), count(*) FILTER (WHERE " + _SQL_SWIEZA + ") " + _SQL_TRASY, par).fetchone()
+    return cele, razem, pominiete
 
 
 def sprawdz_i_zapisz(br, baza, zad, pauza, koniec):
@@ -188,7 +197,8 @@ def main():
             reszta = max(0, a.max - len(kol))
             tanie, razem, pominiete = ([], 0, 0)
             if reszta:
-                tanie, razem, pominiete = najtansze_z_bazy(conn, skady, reszta + len(kol), a.swiezosc_h, a.horyzont_dni)
+                tanie, razem, pominiete = najtansze_z_bazy(conn, skady, reszta + len(kol), a.swiezosc_h,
+                                                           a.horyzont_dni, liczniki=a.sucho)
                 juz = {(k[0], k[1], k[3], k[4]) for k in kol}
                 tanie = [t for t in tanie if (t[0], t[1], t[3], t[4]) not in juz][:reszta]
         return kol, tanie, razem, pominiete

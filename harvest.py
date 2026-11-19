@@ -413,11 +413,16 @@ def zbierz_jednokierunkowe(sesja, token, baza_url, miasta, mies, koniec, skady=(
                     odcinki.add((x, b, m))
                     if (a, b) in priorytet:
                         odcinki_prio.update({(a, x, m), (x, b, m)})
-        pobrano = {(s, c, m): t.timestamp() for s, c, m, t in conn.execute(
-            "SELECT skad, cel, miesiac, pobrano FROM harvest_jedn").fetchall()}
-    prog = time.time() - ODSWIEZ_JEDN_H * 3600
-    do_zrobienia = sorted((o for o in odcinki if pobrano.get(o, 0) < prog),
-                          key=lambda o: (o not in odcinki_prio, pobrano.get(o, 0), o))
+        # Oszczędność transferu Neon: wysyłamy listę odcinków do bazy (transfer DO bazy jest darmowy),
+        # a baza odsyła tylko te do pobrania (nigdy niepobrane albo starsze niż próg), a nie całą tabelę harvest_jedn.
+        lista = sorted(odcinki)
+        pobrano = {(s, c, m): float(t) for s, c, m, t in conn.execute(
+            "SELECT o.s, o.c, o.m, COALESCE(extract(epoch FROM h.pobrano), 0) "
+            "FROM unnest(%s::text[], %s::text[], %s::text[]) AS o(s, c, m) "
+            "LEFT JOIN harvest_jedn h ON h.skad = o.s AND h.cel = o.c AND h.miesiac = o.m "
+            "WHERE h.pobrano IS NULL OR h.pobrano < now() - %s * interval '1 hour'",
+            ([o[0] for o in lista], [o[1] for o in lista], [o[2] for o in lista], ODSWIEZ_JEDN_H)).fetchall()}
+    do_zrobienia = sorted(pobrano, key=lambda o: (o not in odcinki_prio, pobrano[o], o))
     print(f"[jednokierunkowe] pary: {len(pary)} (z aplikacji lub HARVEST_OPENJAW: {len(priorytet)}), "
           f"miesięcy: {len(mies)}, odcinków: {len(odcinki)}, do pobrania: {len(do_zrobienia)}")
     zrobione = bledy = 0
